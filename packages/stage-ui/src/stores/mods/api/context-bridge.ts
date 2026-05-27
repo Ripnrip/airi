@@ -506,7 +506,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
           contextId: event.data.contextId,
           eventId: event.data.id,
           textPreview: event.data.text,
-          sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id ?? event.source,
+          sourceLabel: getMetadataSourceLabel(event.metadata?.source) ?? event.source,
           details: event,
         })
         const contextMessage: ContextMessage = {
@@ -517,7 +517,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
         const ingestAttempt = ingestContextMessageSafely({
           channel: 'server',
           contextMessage,
-          sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id ?? event.source,
+          sourceLabel: getMetadataSourceLabel(event.metadata?.source) ?? event.source,
           details: event,
         })
         if (!ingestAttempt.ok)
@@ -534,7 +534,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
             eventId: contextMessage.id,
             mutation: ingestAttempt.result.mutation,
             textPreview: contextMessage.text,
-            sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id ?? event.source,
+            sourceLabel: getMetadataSourceLabel(event.metadata?.source) ?? event.source,
             details: {
               entryCount: ingestAttempt.result.entryCount,
               event,
@@ -551,7 +551,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
           contextId: contextMessage.contextId,
           eventId: contextMessage.id,
           textPreview: contextMessage.text,
-          sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id ?? event.source,
+          sourceLabel: getMetadataSourceLabel(event.metadata?.source) ?? event.source,
           details: contextMessage,
         })
       }))
@@ -586,7 +586,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
               contextId: update.contextId,
               eventId: update.id,
               textPreview: update.text,
-              sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id ?? event.source,
+              sourceLabel: getMetadataSourceLabel(event.metadata?.source) ?? event.source,
               details: {
                 inputType: event.type,
                 update,
@@ -600,7 +600,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
             const ingestAttempt = ingestContextMessageSafely({
               channel: 'input',
               contextMessage,
-              sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id ?? event.source,
+              sourceLabel: getMetadataSourceLabel(event.metadata?.source) ?? event.source,
               details: {
                 inputType: event.type,
                 update: contextMessage,
@@ -622,7 +622,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
                 eventId: contextMessage.id,
                 mutation: ingestAttempt.result.mutation,
                 textPreview: contextMessage.text,
-                sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id ?? event.source,
+                sourceLabel: getMetadataSourceLabel(event.metadata?.source) ?? event.source,
                 details: {
                   entryCount: ingestAttempt.result.entryCount,
                   inputType: event.type,
