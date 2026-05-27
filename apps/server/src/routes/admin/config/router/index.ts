@@ -1,4 +1,3 @@
-import type { Env } from '../../../../libs/env'
 import type { AdminRouterConfigService, SliceInput } from '../../../../services/domain/admin/router-config'
 import type { HonoEnv } from '../../../../types/hono'
 
@@ -91,6 +90,12 @@ const UnspeechSliceSchema = object({
     ),
     plaintextKey: pipe(string(), nonEmpty('streaming.plaintextKey is required'), maxLength(MAX_KEY_LENGTH)),
     keyEntryId: optional(pipe(string(), nonEmpty(), maxLength(200), NO_PIPE)),
+    models: optional(array(object({
+      id: pipe(string(), nonEmpty('streaming.models[].id is required'), maxLength(200)),
+      name: optional(pipe(string(), nonEmpty(), maxLength(200))),
+      description: optional(pipe(string(), nonEmpty(), maxLength(500))),
+    }))),
+    defaultModel: optional(pipe(string(), nonEmpty('streaming.defaultModel must not be empty'), maxLength(200))),
   })),
 })
 
@@ -169,11 +174,10 @@ const BodySchema = object({
  */
 export function createAdminRouterConfigRoutes(
   service: AdminRouterConfigService,
-  env: Env,
 ) {
   return new Hono<HonoEnv>()
     .use('*', authGuard)
-    .use('*', adminGuard(env))
+    .use('*', adminGuard)
     .post('/', async (c) => {
       const user = c.get('user')!
 
