@@ -50,6 +50,7 @@ vi.mock('crossws/websocket', () => ({
 }))
 
 const { Client } = await import('../src/client')
+const { createWebSocketExtensionPeer } = await import('../src/extension-peer')
 
 function lastSocket() {
   const socket = MockWebSocket.instances.at(-1)
@@ -217,6 +218,53 @@ describe('client', () => {
     })
 
     await expect(connected).resolves.toBeUndefined()
+  })
+
+  it('supports manual handshake for extension peers without legacy module announce', async () => {
+    const client = new Client({
+      autoConnect: false,
+      autoReconnect: false,
+      handshake: 'manual',
+      name: 'test-extension',
+    })
+
+    const connected = client.connect()
+    const socket = lastSocket()
+
+    emitOpen(socket)
+
+    await expect(connected).resolves.toBeUndefined()
+    expect(client.connectionStatus).toBe('ready')
+    expect(socket.sent).toHaveLength(0)
+  })
+
+  it('uses manual handshake when creating websocket extension peers', async () => {
+    const peer = createWebSocketExtensionPeer({
+      extension: {
+        id: 'test-extension',
+        sessionId: 'session-1',
+      },
+      clientOptions: {
+        autoReconnect: false,
+      },
+    })
+
+    const connected = peer.connect()
+    const socket = lastSocket()
+
+    emitOpen(socket)
+    await expect(connected).resolves.toBeUndefined()
+
+    expect(socket.sent).toHaveLength(0)
+
+    peer.authenticatePeer({ token: 'secret', peerId: 'peer-1' })
+    expect(parseSent(socket)).toMatchObject({
+      type: 'peer:authenticate',
+      data: {
+        token: 'secret',
+        peerId: 'peer-1',
+      },
+    })
   })
 
   it('supports timeout-aware ensureConnected without cancelling the shared connect task', async () => {

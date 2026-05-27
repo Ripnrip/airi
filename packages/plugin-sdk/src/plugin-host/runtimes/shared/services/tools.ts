@@ -11,7 +11,7 @@ import type {
  * Stores one plugin tool registration inside the in-memory host runtime.
  *
  * Use when:
- * - Tracking tool ownership and availability per plugin session
+ * - Tracking tool ownership and availability per extension session
  *
  * Expects:
  * - `ownerPluginId` and `tool.id` together are unique
@@ -31,7 +31,7 @@ export interface ToolRegistryRecord {
  * Stores one plugin toolset prompt registration inside the in-memory host runtime.
  *
  * Use when:
- * - Tracking prompt ownership and lifecycle for a plugin-owned toolset
+ * - Tracking prompt ownership and lifecycle for a extension-owned toolset
  *
  * Expects:
  * - `ownerPluginId` and `toolset.id` together are unique

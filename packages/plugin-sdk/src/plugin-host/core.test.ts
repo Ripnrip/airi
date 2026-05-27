@@ -1,4 +1,4 @@
-import type { ModulePermissionDeclaration } from './shared/types'
+import type { ExtensionManifestV1, ModulePermissionDeclaration } from './shared/types'
 
 import { join } from 'node:path'
 
@@ -13,18 +13,523 @@ import {
   moduleStatus,
   registryModulesSync,
 } from '@proj-airi/plugin-protocol/types'
+import { safeParse } from 'valibot'
 import { describe, expect, it, vi } from 'vitest'
 
-import { FileSystemLoader, PluginHost } from '.'
+import { ExtensionHost, extensionManifestV1Schema, FileSystemLoader } from '.'
+import { defineExtension } from '../extension'
+import { defineKit } from '../kit'
 import { createApis } from '../plugin/apis/client'
 import { protocolCapabilityWait, protocolProviders } from '../plugin/apis/protocol'
+
+describe('extension manifest schema', () => {
+  it('accepts extension.airi.json v1 manifests', () => {
+    const result = safeParse(extensionManifestV1Schema, {
+      apiVersion: 'v1',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'airi-extension-test',
+      permissions: {},
+      entrypoints: {
+        electron: './extension.mjs',
+      },
+    })
+
+    expect(result.success).toBe(true)
+  })
+
+  it('rejects legacy extension manifests', () => {
+    const result = safeParse(extensionManifestV1Schema, {
+      apiVersion: 'v1',
+      kind: 'manifest.plugin.airi.moeru.ai',
+      name: 'airi-plugin-test',
+      permissions: {},
+      entrypoints: {
+        electron: './plugin.mjs',
+      },
+    })
+
+    expect(result.success).toBe(false)
+  })
+})
+
+describe('for ExtensionHost', () => {
+  it('runs extension setup and registers multiple module sessions', async () => {
+    const host = new ExtensionHost()
+    const extension = defineExtension({
+      id: 'airi-extension-test',
+      async setup(ctx) {
+        await ctx.modules.register({ id: 'module-a' })
+        await ctx.modules.register({ id: 'module-b' })
+      },
+    })
+
+    const session = await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-test',
+        permissions: {},
+        entrypoints: {},
+      },
+    })
+
+    expect(session.extension.id).toBe('airi-extension-test')
+    expect(host.listModules().map(module => module.id)).toEqual(['module-a', 'module-b'])
+  })
+
+  it('disposes modules registered before setup failure', async () => {
+    const disposed: string[] = []
+    const host = new ExtensionHost()
+    const extension = defineExtension({
+      id: 'airi-extension-failing',
+      async setup(ctx) {
+        const first = await ctx.modules.register({ id: 'first' })
+        first.subscriptions.add({
+          dispose: () => {
+            disposed.push('first-subscription')
+          },
+        })
+        const second = await ctx.modules.register({ id: 'second' })
+        second.subscriptions.add({
+          dispose: () => {
+            disposed.push('second-subscription')
+          },
+        })
+        throw new Error('setup failed')
+      },
+    })
+
+    await expect(host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-failing',
+        permissions: {},
+        entrypoints: {},
+      },
+    })).rejects.toThrow('setup failed')
+
+    expect(disposed).toEqual(['second-subscription', 'first-subscription'])
+    expect(host.listModules()).toEqual([])
+  })
+
+  it('lets extension setup use granted kits without registering a module', async () => {
+    const host = new ExtensionHost()
+    const kit = defineKit({
+      id: 'kit.extension-direct',
+      version: '1.0.0',
+      createClient: runtime => ({
+        ping: () => `${runtime.extensionId}:${runtime.sessionId}:${runtime.moduleId ?? 'root'}`,
+      }),
+    })
+    host.registerKitApi(kit)
+
+    let observed = ''
+    const extension = defineExtension({
+      id: 'airi-extension-direct-kit',
+      async setup(ctx) {
+        const client = await ctx.kits.use(kit)
+        observed = client.ping()
+      },
+    })
+
+    await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-direct-kit',
+        permissions: {
+          apis: [{ key: 'kit.extension-direct', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+
+    expect(observed).toContain('airi-extension-direct-kit:')
+    expect(observed).toContain(':root')
+    expect(host.listModules()).toEqual([])
+  })
+
+  it('denies extension-scoped kit use when the extension grant does not allow the kit', async () => {
+    const host = new ExtensionHost()
+    const kit = defineKit({
+      id: 'kit.extension-denied',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+    host.registerKitApi(kit)
+
+    const extension = defineExtension({
+      id: 'airi-extension-direct-kit-denied',
+      async setup(ctx) {
+        const result = await ctx.kits.tryUse(kit)
+        expect(result.ok).toBe(false)
+        if (!('reason' in result)) {
+          throw new Error('Expected direct kit use to be denied.')
+        }
+        expect(result.reason).toBe('permission-denied')
+      },
+    })
+
+    await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-direct-kit-denied',
+        permissions: {
+          apis: [{ key: 'kit.other', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+  })
+
+  it('denies extension-scoped kit use when host permission resolver narrows the manifest grant', async () => {
+    const host = new ExtensionHost({
+      permissionResolver: () => ({
+        apis: [{ key: 'kit.other', actions: ['invoke'] }],
+      }),
+    })
+    const kit = defineKit({
+      id: 'kit.extension-resolver-denied',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+    host.registerKitApi(kit)
+
+    const extension = defineExtension({
+      id: 'airi-extension-direct-kit-resolver-denied',
+      async setup(ctx) {
+        const result = await ctx.kits.tryUse(kit)
+        expect(result.ok).toBe(false)
+        if (!('reason' in result)) {
+          throw new Error('Expected direct kit use to be denied.')
+        }
+        expect(result.reason).toBe('permission-denied')
+      },
+    })
+
+    await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-direct-kit-resolver-denied',
+        permissions: {
+          apis: [{ key: 'kit.extension-resolver-denied', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+  })
+
+  it('does not let persisted grants override a later permission resolver decision', async () => {
+    let grantRequestedKit = true
+    const host = new ExtensionHost({
+      permissionResolver: () => ({
+        apis: [{
+          key: grantRequestedKit ? 'kit.extension-persisted-revoked' : 'kit.other',
+          actions: ['invoke'],
+        }],
+      }),
+    })
+    const kit = defineKit({
+      id: 'kit.extension-persisted-revoked',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+    host.registerKitApi(kit)
+
+    const manifest = {
+      apiVersion: 'v1',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'airi-extension-direct-kit-persisted-revoked',
+      permissions: {
+        apis: [{ key: 'kit.extension-persisted-revoked', actions: ['invoke'] }],
+      },
+      entrypoints: {},
+    } satisfies ExtensionManifestV1
+
+    const grantedExtension = defineExtension({
+      id: 'airi-extension-direct-kit-persisted-revoked',
+      async setup(ctx) {
+        const result = await ctx.kits.tryUse(kit)
+        expect(result.ok).toBe(true)
+      },
+    })
+
+    await host.startExtension(grantedExtension, { manifest })
+
+    grantRequestedKit = false
+    const revokedExtension = defineExtension({
+      id: 'airi-extension-direct-kit-persisted-revoked',
+      async setup(ctx) {
+        const result = await ctx.kits.tryUse(kit)
+        expect(result.ok).toBe(false)
+        if (!('reason' in result)) {
+          throw new Error('Expected direct kit use to be denied.')
+        }
+        expect(result.reason).toBe('permission-denied')
+      },
+    })
+
+    await host.startExtension(revokedExtension, { manifest })
+  })
+
+  it('denies module-scoped kit use when host permission resolver narrows the extension grant', async () => {
+    const host = new ExtensionHost({
+      permissionResolver: () => ({
+        apis: [{ key: 'kit.other', actions: ['invoke'] }],
+      }),
+    })
+    const kit = defineKit({
+      id: 'kit.module-resolver-denied',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+    host.registerKitApi(kit)
+
+    const extension = defineExtension({
+      id: 'airi-extension-module-kit-resolver-denied',
+      async setup(ctx) {
+        const module = await ctx.modules.register({
+          id: 'module-a',
+          permissions: {
+            apis: [{ key: 'kit.module-resolver-denied', actions: ['invoke'] }],
+          },
+        })
+        const result = await module.kits.tryUse(kit)
+        expect(result.ok).toBe(false)
+        if (!('reason' in result)) {
+          throw new Error('Expected module kit use to be denied.')
+        }
+        expect(result.reason).toBe('permission-denied')
+      },
+    })
+
+    await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-module-kit-resolver-denied',
+        permissions: {
+          apis: [{ key: 'kit.module-resolver-denied', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+  })
+
+  it('lets extension setup watch kit availability without registering a module', async () => {
+    const host = new ExtensionHost()
+    const kit = defineKit({
+      id: 'kit.extension-watch',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+
+    const observed: boolean[] = []
+    const extension = defineExtension({
+      id: 'airi-extension-direct-kit-watch',
+      async setup(ctx) {
+        ctx.kits.watch(kit, (availability) => {
+          observed.push(availability.available)
+        })
+      },
+    })
+
+    await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-direct-kit-watch',
+        permissions: {
+          apis: [{ key: 'kit.extension-watch', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+
+    host.registerKitApi(kit)
+
+    expect(observed).toEqual([false, true])
+  })
+
+  it('disposes extension-scoped kit availability watchers with the extension session', async () => {
+    const host = new ExtensionHost()
+    const kit = defineKit({
+      id: 'kit.extension-watch-dispose',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+
+    const observed: boolean[] = []
+    const extension = defineExtension({
+      id: 'airi-extension-direct-kit-watch-dispose',
+      async setup(ctx) {
+        ctx.kits.watch(kit, (availability) => {
+          observed.push(availability.available)
+        })
+      },
+    })
+
+    const session = await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-direct-kit-watch-dispose',
+        permissions: {
+          apis: [{ key: 'kit.extension-watch-dispose', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+
+    await session.subscriptions.dispose()
+    host.registerKitApi(kit)
+
+    expect(observed).toEqual([false])
+  })
+
+  it('supports required, optional, and watched kit availability', async () => {
+    const host = new ExtensionHost()
+    const kit = defineKit({
+      id: 'kit.test',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+    host.registerKitApi(kit)
+
+    let watched = false
+    const extension = defineExtension({
+      id: 'airi-extension-kit-test',
+      async setup(ctx) {
+        const module = await ctx.modules.register({
+          id: 'module-a',
+          permissions: {
+            apis: [{ key: 'kit.test', actions: ['invoke'] }],
+          },
+        })
+        const client = await module.kits.use(kit)
+        expect(client.ping()).toBe('pong')
+
+        const result = await module.kits.tryUse(kit)
+        expect(result.ok).toBe(true)
+
+        module.kits.watch(kit, (availability) => {
+          watched = availability.available
+        })
+      },
+    })
+
+    await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-kit-test',
+        permissions: {
+          apis: [{ key: 'kit.*', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+
+    expect(watched).toBe(true)
+  })
+
+  it('disposes module-scoped kit availability watchers with the module scope', async () => {
+    const host = new ExtensionHost()
+    const kit = defineKit({
+      id: 'kit.module-watch-dispose',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+
+    const observed: boolean[] = []
+    let disposeModule: (() => Promise<void>) | undefined
+    const extension = defineExtension({
+      id: 'airi-extension-module-kit-watch-dispose',
+      async setup(ctx) {
+        const module = await ctx.modules.register({
+          id: 'module-a',
+          permissions: {
+            apis: [{ key: 'kit.module-watch-dispose', actions: ['invoke'] }],
+          },
+        })
+        disposeModule = module.dispose
+        module.kits.watch(kit, (availability) => {
+          observed.push(availability.available)
+        })
+      },
+    })
+
+    await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-module-kit-watch-dispose',
+        permissions: {
+          apis: [{ key: 'kit.module-watch-dispose', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+
+    if (!disposeModule) {
+      throw new Error('Expected module scope to be registered.')
+    }
+    await disposeModule()
+    host.registerKitApi(kit)
+
+    expect(observed).toEqual([false])
+  })
+
+  it('denies kit use when module permissions exceed the extension grant ceiling', async () => {
+    const host = new ExtensionHost()
+    const kit = defineKit({
+      id: 'kit.denied',
+      version: '1.0.0',
+      createClient: () => ({ ping: () => 'pong' }),
+    })
+    host.registerKitApi(kit)
+
+    const extension = defineExtension({
+      id: 'airi-extension-kit-denied',
+      async setup(ctx) {
+        const module = await ctx.modules.register({
+          id: 'module-a',
+          permissions: {
+            apis: [{ key: 'kit.denied', actions: ['invoke'] }],
+          },
+        })
+        const result = await module.kits.tryUse(kit)
+        expect(result.ok).toBe(false)
+        if (!('reason' in result)) {
+          throw new Error('Expected kit use to be denied.')
+        }
+        expect(result.reason).toBe('permission-denied')
+      },
+    })
+
+    await host.startExtension(extension, {
+      manifest: {
+        apiVersion: 'v1',
+        kind: 'manifest.extension.airi.moeru.ai' as const,
+        id: 'airi-extension-kit-denied',
+        permissions: {
+          apis: [{ key: 'kit.other', actions: ['invoke'] }],
+        },
+        entrypoints: {},
+      },
+    })
+  })
+})
 
 function assertNever(value: never): never {
   throw new Error(`Unsupported capability state: ${value}`)
 }
 
 function reportPluginCapability(
-  host: PluginHost,
+  host: ExtensionHost,
   payload: { key: string, state: 'announced' | 'ready', metadata?: Record<string, unknown> },
 ) {
   switch (payload.state) {
@@ -58,8 +563,8 @@ describe('for FileSystemPluginHost', () => {
 
     const pluginDef = await host.loadPluginFor({
       apiVersion: 'v1',
-      kind: 'manifest.plugin.airi.moeru.ai',
-      name: 'test-plugin',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin',
       permissions: testPermissions,
       entrypoints: {
         electron: join(import.meta.dirname, 'testdata', 'test-normal-plugin.ts'),
@@ -80,8 +585,8 @@ describe('for FileSystemPluginHost', () => {
 
     const pluginDef = await host.loadPluginFor({
       apiVersion: 'v1',
-      kind: 'manifest.plugin.airi.moeru.ai',
-      name: 'test-plugin',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin',
       permissions: testPermissions,
       entrypoints: {
         node: join(import.meta.dirname, 'testdata', 'test-normal-plugin.ts'),
@@ -97,8 +602,8 @@ describe('for FileSystemPluginHost', () => {
 
     await expect(host.loadPluginFor({
       apiVersion: 'v1',
-      kind: 'manifest.plugin.airi.moeru.ai',
-      name: 'test-plugin',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin',
       permissions: testPermissions,
       entrypoints: {
         electron: join(import.meta.dirname, 'testdata', 'test-error-plugin.ts'),
@@ -110,8 +615,8 @@ describe('for FileSystemPluginHost', () => {
     const host = new FileSystemLoader()
     const baseManifest = {
       apiVersion: 'v1' as const,
-      kind: 'manifest.plugin.airi.moeru.ai' as const,
-      name: 'test-plugin',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin',
       permissions: testPermissions,
     }
 
@@ -158,8 +663,8 @@ describe('for FileSystemPluginHost', () => {
 
     expect(host.resolveEntrypointFor({
       apiVersion: 'v1',
-      kind: 'manifest.plugin.airi.moeru.ai',
-      name: 'test-plugin',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin',
       permissions: testPermissions,
       entrypoints: {
         node: '/opt/plugins/entry.ts',
@@ -175,15 +680,15 @@ describe('for FileSystemPluginHost', () => {
 
     expect(() => host.resolveEntrypointFor({
       apiVersion: 'v1',
-      kind: 'manifest.plugin.airi.moeru.ai',
-      name: 'test-plugin',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin',
       permissions: testPermissions,
       entrypoints: {},
     }, { runtime: 'node' })).toThrow('Plugin entrypoint is required for runtime `node`.')
   })
 })
 
-describe('for PluginHost', () => {
+describe('for ExtensionHost lifecycle', () => {
   const providersCapability = 'proj-airi:plugin-sdk:apis:protocol:resources:providers:list-providers'
   const kitRegistryResourceKey = 'proj-airi:plugin-sdk:resources:kits'
   const toolRegistryResourceKey = 'proj-airi:plugin-sdk:resources:tools'
@@ -191,8 +696,8 @@ describe('for PluginHost', () => {
   const customSessionApiPingEventName = 'proj-airi:plugin-sdk:apis:client:test-session-api:ping'
   const testManifest = {
     apiVersion: 'v1' as const,
-    kind: 'manifest.plugin.airi.moeru.ai' as const,
-    name: 'test-plugin',
+    kind: 'manifest.extension.airi.moeru.ai' as const,
+    id: 'test-plugin',
     permissions: {
       apis: [
         { key: 'proj-airi:plugin-sdk:apis:protocol:capabilities:wait', actions: ['invoke'] },
@@ -254,7 +759,7 @@ describe('for PluginHost', () => {
     } satisfies ModulePermissionDeclaration,
   }
 
-  function registerWidgetKit(host: PluginHost) {
+  function registerWidgetKit(host: ExtensionHost) {
     return host.registerKit({
       kitId: 'kit.widget',
       version: '1.0.0',
@@ -267,7 +772,7 @@ describe('for PluginHost', () => {
   }
 
   it('should run plugin lifecycle to ready in-memory', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -298,15 +803,15 @@ describe('for PluginHost', () => {
   })
 
   it('should fail initialization when plugin init returns false', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
 
     const session = await host.load({
       apiVersion: 'v1',
-      kind: 'manifest.plugin.airi.moeru.ai',
-      name: 'test-plugin-no-connect',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin-no-connect',
       permissions: testManifest.permissions,
       entrypoints: {
         electron: join(import.meta.dirname, 'testdata', 'test-no-connect-plugin.ts'),
@@ -320,7 +825,7 @@ describe('for PluginHost', () => {
   })
 
   it('should expose runtime-compatible kits through bound plugin apis', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -345,8 +850,8 @@ describe('for PluginHost', () => {
     expect(capabilities).toEqual(widgetKit.capabilities)
   })
 
-  it('should expose plugin tool client bindings on the plugin session api surface', async () => {
-    const host = new PluginHost({
+  it('should expose plugin tool client bindings on the extension session api surface', async () => {
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -382,7 +887,7 @@ describe('for PluginHost', () => {
     const callCustomNamespace = vi.fn(({ ownerPluginId, message }: { ownerPluginId: string, message: string }) => {
       return `${ownerPluginId}:${message}`
     })
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
       contributions: [{
@@ -426,7 +931,7 @@ describe('for PluginHost', () => {
   })
 
   it('should register available plugin tools and expose serialized xsai schemas', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -535,7 +1040,7 @@ describe('for PluginHost', () => {
   })
 
   it('should hide and reject tools registered by stopped sessions', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -579,7 +1084,7 @@ describe('for PluginHost', () => {
 
   it('should clean up sessions modules and tools when a session-ready hook throws during init', async () => {
     const readyHookError = new Error('session-ready hook failed')
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
       contributions: [{
@@ -641,7 +1146,7 @@ describe('for PluginHost', () => {
 
   it('should finish stop cleanup before rethrowing a session-stopped hook failure', async () => {
     const stoppedHookError = new Error('session-stopped hook failed')
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
       contributions: [{
@@ -696,7 +1201,7 @@ describe('for PluginHost', () => {
   })
 
   it('should allow plugin to announce update activate and withdraw dynamic bindings through bound apis', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -777,7 +1282,7 @@ describe('for PluginHost', () => {
   })
 
   it('should let a test plugin consume injected kit and binding apis during init', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -786,7 +1291,7 @@ describe('for PluginHost', () => {
 
     const session = await host.start({
       ...dynamicApiManifest,
-      name: 'test-plugin-injected-host-apis',
+      id: 'test-plugin-injected-host-apis',
       entrypoints: {
         electron: join(import.meta.dirname, 'testdata', 'test-injected-host-apis-plugin.ts'),
       },
@@ -811,7 +1316,7 @@ describe('for PluginHost', () => {
   })
 
   it('should reuse dynamic binding ids after stop cleanup and reload', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -846,8 +1351,8 @@ describe('for PluginHost', () => {
     expect(reused.config).toEqual({ route: '/widgets/reuse-2' })
   })
 
-  it('should isolate plugin-facing kit and module snapshots from plugin-side mutation', async () => {
-    const host = new PluginHost({
+  it('should isolate plugin-facing kit and module snapshots from extension-side mutation', async () => {
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -907,7 +1412,7 @@ describe('for PluginHost', () => {
   })
 
   it('should deny new kit apis when resource read permission is missing', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -924,12 +1429,12 @@ describe('for PluginHost', () => {
   })
 
   it('should reject non in-memory transport for MVP', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'websocket', url: 'ws://localhost:3000' },
     })
 
-    await expect(host.start(testManifest, { cwd: '' })).rejects.toThrow('Only in-memory transport is currently supported by PluginHost alpha.')
+    await expect(host.start(testManifest, { cwd: '' })).rejects.toThrow('Only in-memory transport is currently supported by ExtensionHost alpha.')
   })
 
   it('should be able to expose setupModules', async () => {
@@ -937,8 +1442,8 @@ describe('for PluginHost', () => {
 
     const pluginDef = await loader.loadPluginFor({
       apiVersion: 'v1',
-      kind: 'manifest.plugin.airi.moeru.ai',
-      name: 'test-plugin',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin',
       permissions: testManifest.permissions,
       entrypoints: {
         electron: join(import.meta.dirname, 'testdata', 'test-normal-plugin.ts'),
@@ -973,7 +1478,7 @@ describe('for PluginHost', () => {
   })
 
   it('should wait for required capabilities before proceeding init', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -990,7 +1495,7 @@ describe('for PluginHost', () => {
     })
 
     await new Promise(resolve => setTimeout(resolve, 20))
-    const loadingSession = host.listSessions().find(item => item.manifest.name === testManifest.name)
+    const loadingSession = host.listSessions().find(item => item.manifest.id === testManifest.id)
     expect(loadingSession?.phase).toBe('waiting-deps')
 
     reportPluginCapability(host, {
@@ -1003,7 +1508,7 @@ describe('for PluginHost', () => {
   })
 
   it('should emit dependency wait details while waiting for required capabilities', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1047,7 +1552,7 @@ describe('for PluginHost', () => {
   })
 
   it('should fail when required capabilities timeout', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1060,7 +1565,7 @@ describe('for PluginHost', () => {
   })
 
   it('should support degraded and withdrawn capability states', () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1096,7 +1601,7 @@ describe('for PluginHost', () => {
   })
 
   it('should resolve waits only when capability reaches ready state', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1119,7 +1624,7 @@ describe('for PluginHost', () => {
   })
 
   it('should preserve previous cwd when reloading plugin', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1131,8 +1636,8 @@ describe('for PluginHost', () => {
 
     const session = await host.start({
       apiVersion: 'v1',
-      kind: 'manifest.plugin.airi.moeru.ai',
-      name: 'test-reload-relative-entrypoint',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-reload-relative-entrypoint',
       permissions: testManifest.permissions,
       entrypoints: {
         electron: './test-normal-plugin.ts',
@@ -1144,7 +1649,7 @@ describe('for PluginHost', () => {
   })
 
   it('should emit downgraded compatibility result when fallback versions overlap', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
       protocolVersion: 'v2',
@@ -1184,7 +1689,7 @@ describe('for PluginHost', () => {
   })
 
   it('should trim whitespace in supported compatibility versions before negotiating', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
       protocolVersion: 'v2',
@@ -1224,7 +1729,7 @@ describe('for PluginHost', () => {
   })
 
   it('should reject initialization when compatibility has no overlap', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
       protocolVersion: 'v2',
@@ -1244,8 +1749,8 @@ describe('for PluginHost', () => {
     expect(host.getSession(session.id)).toBeUndefined()
   })
 
-  it('should isolate module status events between plugin sessions', async () => {
-    const host = new PluginHost({
+  it('should isolate module status events between extension sessions', async () => {
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1257,11 +1762,11 @@ describe('for PluginHost', () => {
 
     const sessionOne = await host.start({
       ...testManifest,
-      name: 'test-plugin-session-one',
+      id: 'test-extension-session-one',
     }, { cwd: '' })
     const sessionTwo = await host.start({
       ...testManifest,
-      name: 'test-plugin-session-two',
+      id: 'test-extension-session-two',
     }, { cwd: '' })
 
     const onSessionOneStatus = vi.fn()
@@ -1276,18 +1781,18 @@ describe('for PluginHost', () => {
   })
 
   it('should keep invoke handlers isolated per plugin context', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
 
     const sessionOne = await host.load({
       ...testManifest,
-      name: 'test-plugin-session-one',
+      id: 'test-extension-session-one',
     }, { cwd: '' })
     const sessionTwo = await host.load({
       ...testManifest,
-      name: 'test-plugin-session-two',
+      id: 'test-extension-session-two',
     }, { cwd: '' })
 
     defineInvokeHandler(sessionOne.channels.host, protocolProviders.listProviders, async () => [{ name: 'provider:one' }])
@@ -1301,7 +1806,7 @@ describe('for PluginHost', () => {
   })
 
   it('should expose provider resources through the generic resource resolver API', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1315,7 +1820,7 @@ describe('for PluginHost', () => {
   })
 
   it('should include active modules in registry sync when initializing another session', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1327,13 +1832,13 @@ describe('for PluginHost', () => {
 
     const sessionOne = await host.start({
       ...testManifest,
-      name: 'test-plugin-session-one',
+      id: 'test-extension-session-one',
     }, { cwd: '' })
     expect(sessionOne.phase).toBe('ready')
 
     const sessionTwo = await host.load({
       ...testManifest,
-      name: 'test-plugin-session-two',
+      id: 'test-extension-session-two',
     }, { cwd: '' })
 
     const syncEvents: Array<{ body?: { modules?: Array<{ name: string }> } }> = []
@@ -1346,12 +1851,12 @@ describe('for PluginHost', () => {
       .flatMap(event => event.body?.modules ?? [])
       .map(module => module.name)
 
-    expect(moduleNames).toContain('test-plugin-session-one')
-    expect(moduleNames).toContain('test-plugin-session-two')
+    expect(moduleNames).toContain('test-extension-session-one')
+    expect(moduleNames).toContain('test-extension-session-two')
   })
 
   it('should support runtime permission requests before granting deferred scopes', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })
@@ -1476,7 +1981,7 @@ describe('for PluginHost', () => {
   })
 
   it('should only emit denied scopes that remain precisely representable after partial approval', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
       permissionResolver: ({ requested }) => ({
@@ -1494,8 +1999,8 @@ describe('for PluginHost', () => {
 
     const manifest = {
       apiVersion: 'v1' as const,
-      kind: 'manifest.plugin.airi.moeru.ai' as const,
-      name: 'test-plugin-denied-partial',
+      kind: 'manifest.extension.airi.moeru.ai' as const,
+      id: 'test-plugin-denied-partial',
       permissions: {
         apis: [
           ...(testManifest.permissions.apis ?? []),
@@ -1568,7 +2073,7 @@ describe('for PluginHost', () => {
   })
 
   it('should isolate runtime permission grants between concurrent same-name sessions', async () => {
-    const host = new PluginHost({
+    const host = new ExtensionHost({
       runtime: 'electron',
       transport: { kind: 'in-memory' },
     })

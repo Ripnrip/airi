@@ -1,6 +1,6 @@
-import type { PluginHost } from '@proj-airi/plugin-sdk/plugin-host'
+import type { ExtensionHost } from '@proj-airi/plugin-sdk/plugin-host'
 
-import type { SetupPluginHostOptions } from '../types'
+import type { SetupExtensionHostOptions } from '../types'
 
 import {
   createGameletHostContribution,
@@ -9,7 +9,7 @@ import {
 import { registerWidgetPluginKit } from './widget'
 
 /**
- * Creates the built-in kit runtime installed by the Electron plugin host.
+ * Creates the built-in kit runtime installed by the Electron extension host.
  *
  * Use when:
  * - Host bootstrap should depend on a kit-layer API instead of wiring widget/gamelet details inline
@@ -21,10 +21,10 @@ import { registerWidgetPluginKit } from './widget'
  * Returns:
  * - Helpers to attach contributions and register built-in kits on the host
  */
-export function createBuiltInPluginKitRuntime(options: SetupPluginHostOptions): {
+export function createBuiltInExtensionKitRuntime(options: SetupExtensionHostOptions): {
   contributions: ReturnType<typeof createGameletHostContribution>['contribution'][]
-  attachHost: (host: PluginHost) => void
-  registerHostKits: (host: PluginHost) => void
+  attachHost: (host: ExtensionHost) => void
+  registerHostKits: (host: ExtensionHost) => void
 } {
   const gameletContribution = createGameletHostContribution({
     widgetsManager: options.widgetsManager,

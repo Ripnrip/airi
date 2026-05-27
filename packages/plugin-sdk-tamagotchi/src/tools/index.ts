@@ -1,7 +1,8 @@
-import type { ContextInit } from '@proj-airi/plugin-sdk'
+import type { ContextInit, KitClientRuntime } from '@proj-airi/plugin-sdk'
 import type { HostDataRecord, ToolsetPromptManifest } from '@proj-airi/plugin-sdk/plugin-host'
 import type { JsonSchema, Schema as StandardSchemaV1 } from 'xsschema'
 
+import { defineKit } from '@proj-airi/plugin-sdk'
 import { hostDataRecordSchema } from '@proj-airi/plugin-sdk/plugin-host'
 import { parse } from 'valibot'
 import { toJsonSchema } from 'xsschema'
@@ -14,7 +15,7 @@ import { toJsonSchema } from 'xsschema'
  * - Runtime validation needs a structural contract independent from `@proj-airi/plugin-sdk`
  *
  * Expects:
- * - The stage-tamagotchi host contribution installs `gamelets` on the plugin session API object
+ * - The stage-tamagotchi host contribution installs `gamelets` on the extension session API object
  *
  * Returns:
  * - The host-backed gamelet control surface exposed to tool callbacks
@@ -31,7 +32,7 @@ export interface ToolExecutionGameletApi {
  * Describes the tamagotchi-flavored plugin context accepted by {@link defineToolset}.
  *
  * Use when:
- * - A plugin host exposes tool registration plus the stage-owned `gamelets` surface
+ * - A extension host exposes tool registration plus the stage-owned `gamelets` surface
  * - Tests want to model the runtime shape without relying on baked-in SDK typing
  *
  * Expects:
@@ -121,6 +122,33 @@ export interface DefineToolsetOptions<TInputSchema = unknown> {
   id?: string
   prompt?: ToolsetPromptManifest
   tools: Array<PluginToolDefinition<TInputSchema>>
+}
+
+/**
+ * Describes the module-scoped tool authoring client exposed by {@link toolKit}.
+ *
+ * @param TInputSchema - Schema implementation accepted by each tool definition.
+ */
+export interface ToolKitClient<TInputSchema = unknown> {
+  /**
+   * Registers a complete toolset through the host-owned tool registry.
+   */
+  registerToolset: (options: DefineToolsetOptions<TInputSchema>) => Promise<void>
+}
+
+/**
+ * Describes host services required by the tool kit client.
+ */
+export interface ToolKitRuntime extends KitClientRuntime {
+  /**
+   * Host-owned tool registry operations.
+   */
+  tools?: TamagotchiToolContext['apis']['tools']
+
+  /**
+   * Host-owned gamelet operations exposed to tool execution callbacks.
+   */
+  gamelets?: ToolExecutionGameletApi
 }
 
 function isToolExecutionGameletApi(value: unknown): value is ToolExecutionGameletApi {
@@ -361,3 +389,45 @@ export async function defineToolset(
     })
   }
 }
+
+/**
+ * Exposes tamagotchi tool registration as a module-scoped extension kit.
+ *
+ * Use when:
+ * - An extension module wants to register tools through `module.kits.use(toolKit)`
+ * - The host should keep tool transport, permission, and binding details outside authoring code
+ *
+ * Expects:
+ * - The host provides tool registry and gamelet runtime APIs when creating the kit client
+ *
+ * Returns:
+ * - A client that reuses {@link defineToolset} normalization and registration behavior
+ */
+export const toolKit = defineKit<ToolKitClient>({
+  id: 'kit.tool',
+  version: '1.0.0',
+  allowedExposePolicies: ['local-only', 'remote-observable'],
+  defaultExposePolicy: 'local-only',
+  createClient(runtime) {
+    const toolRuntime = runtime as ToolKitRuntime
+
+    return {
+      async registerToolset(options) {
+        if (!toolRuntime.tools) {
+          throw new Error('toolKit requires a host tool registry runtime.')
+        }
+
+        if (!toolRuntime.gamelets) {
+          throw new Error('toolKit requires a host gamelet runtime.')
+        }
+
+        await defineToolset({
+          apis: {
+            tools: toolRuntime.tools,
+            gamelets: toolRuntime.gamelets,
+          },
+        }, options)
+      },
+    }
+  },
+})

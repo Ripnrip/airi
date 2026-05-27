@@ -1,6 +1,9 @@
 import type {
   DeliveryConfig,
+  ExtensionIdentity,
+  ExtensionModuleIdentity,
   MetadataEventSource,
+  ModuleIdentity,
   WebSocketBaseEvent,
   WebSocketEvent,
 } from '@proj-airi/server-shared/types'
@@ -10,7 +13,7 @@ import type {
   RoutingPolicy,
 } from './middlewares'
 import type { ServerWsConsumerSelectionCandidate, ServerWsStickyAssignment } from './server-ws/core'
-import type { AuthenticatedPeer, Peer } from './types'
+import type { AuthenticatedPeer, Peer, RegisteredExtensionModule } from './types'
 
 import { Buffer } from 'node:buffer'
 import { timingSafeEqual } from 'node:crypto'
@@ -392,6 +395,23 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
     broadcastRegistrySync()
   }
 
+  function registerExtensionModulePeer(p: AuthenticatedPeer, module: RegisteredExtensionModule) {
+    p.extensionModules ??= new Map()
+    p.extensionModules.set(module.identity.id, module)
+
+    if (!peersByModule.has(module.name)) {
+      peersByModule.set(module.name, new Map())
+    }
+
+    // NOTICE:
+    // The websocket runtime still has a legacy name/index routing map.
+    // Extension modules are multi-registration records on one peer, so they use the
+    // default index bucket until routing is fully migrated to extension module identity.
+    peersByModule.get(module.name)!.set(undefined, p)
+    p.healthy = true
+    broadcastRegistrySync()
+  }
+
   function registerConsumer(peerId: string, event: string, mode: ReturnType<typeof normalizeConsumerMode>, group?: string, priority?: number) {
     consumers.register({ peerId, event, mode, group, priority })
   }
@@ -468,18 +488,80 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
     broadcastRegistrySync()
   }
 
+  function unregisterExtensionModuleRegistrations(peerInfo: AuthenticatedPeer, reason?: string) {
+    if (!peerInfo.extensionModules?.size) {
+      return
+    }
+
+    for (const module of peerInfo.extensionModules.values()) {
+      const group = peersByModule.get(module.name)
+      if (group?.get(undefined) === peerInfo) {
+        group.delete(undefined)
+
+        if (group.size === 0) {
+          peersByModule.delete(module.name)
+        }
+      }
+
+      broadcastToAuthenticated({
+        type: 'extension:module:de-announced',
+        data: { name: module.name, identity: module.identity, possibleEvents: [], reason },
+        metadata: createEventMetadata(instanceId),
+      })
+    }
+
+    peerInfo.extensionModules.clear()
+    broadcastRegistrySync()
+  }
+
   function unregisterModulePeer(peerInfo: AuthenticatedPeer, reason?: string) {
     unregisterModuleRegistration(peerInfo, { reason })
+    unregisterExtensionModuleRegistrations(peerInfo, reason)
   }
 
   function listKnownModules() {
-    return Array.from(peers.values())
+    const legacyModules = Array.from(peers.values())
       .filter(peerInfo => peerInfo.name && peerInfo.identity)
       .map(peerInfo => ({
         name: peerInfo.name,
         index: peerInfo.index,
         identity: peerInfo.identity!,
       }))
+
+    const extensionModules = Array.from(peers.values()).flatMap(peerInfo =>
+      Array.from(peerInfo.extensionModules?.values() ?? []).map(module => ({
+        name: module.name,
+        identity: module.identity,
+      })),
+    )
+
+    return [...legacyModules, ...extensionModules]
+  }
+
+  function isExtensionIdentity(value: unknown): value is ExtensionIdentity {
+    return Boolean(
+      value
+      && typeof value === 'object'
+      && typeof (value as Partial<ExtensionIdentity>).id === 'string',
+    )
+  }
+
+  function isLegacyModuleIdentity(value: unknown): value is ModuleIdentity {
+    return Boolean(
+      value
+      && typeof value === 'object'
+      && (value as Partial<ModuleIdentity>).kind === 'plugin'
+      && typeof (value as Partial<ModuleIdentity>).plugin?.id === 'string',
+    )
+  }
+
+  function isExtensionModuleIdentity(value: unknown): value is ExtensionModuleIdentity {
+    return Boolean(
+      value
+      && typeof value === 'object'
+      && typeof (value as Partial<ExtensionModuleIdentity>).id === 'string'
+      && isExtensionIdentity((value as Partial<ExtensionModuleIdentity>).extension),
+    )
   }
 
   // === Broadcasting & Registry Synchronization ===
@@ -566,7 +648,7 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
         if (authenticatedPeer) {
           markPeerAlive(authenticatedPeer, { parentId: event.metadata?.event.id })
 
-          if (authenticatedPeer.authenticated && event.metadata?.source) {
+          if (authenticatedPeer.authenticated && isLegacyModuleIdentity(event.metadata?.source)) {
             authenticatedPeer.identity = event.metadata.source
           }
         }
@@ -610,6 +692,139 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
             return
           }
 
+          case 'peer:authenticate': {
+            const clientToken = typeof event.data.token === 'string' ? event.data.token : ''
+            if (authToken && !timingSafeCompare(clientToken, authToken)) {
+              logger.withFields({ peer: peer.id, peerRemote: peer.remoteAddress, peerRequest: peer.request?.url }).log('peer authentication failed')
+              send(peer, RESPONSES.error(ServerErrorMessages.invalidToken, event.metadata?.event.id))
+
+              return
+            }
+
+            send(peer, RESPONSES.peerAuthenticated(event.data.peerId ?? peer.id, event.metadata?.event.id))
+            const p = peers.get(peer.id)
+            if (p) {
+              p.authenticated = true
+            }
+
+            sendRegistrySync(peer, event.metadata?.event.id)
+
+            return
+          }
+
+          case 'extension:authenticate': {
+            const clientToken = typeof event.data.token === 'string' ? event.data.token : ''
+            if (authToken && !timingSafeCompare(clientToken, authToken)) {
+              logger.withFields({ peer: peer.id, peerRemote: peer.remoteAddress, peerRequest: peer.request?.url }).log('extension authentication failed')
+              send(peer, RESPONSES.error(ServerErrorMessages.invalidToken, event.metadata?.event.id))
+
+              return
+            }
+
+            const p = peers.get(peer.id)
+            if (p) {
+              p.authenticated = true
+              p.extensionIdentity = event.data.identity
+            }
+
+            send(peer, RESPONSES.extensionAuthenticated(event.data.identity, event.metadata?.event.id))
+            sendRegistrySync(peer, event.metadata?.event.id)
+
+            return
+          }
+
+          case 'extension:announce': {
+            const p = peers.get(peer.id)
+            if (!p) {
+              return
+            }
+
+            if (authToken && !p.authenticated) {
+              send(peer, RESPONSES.error(ServerErrorMessages.mustAuthenticateBeforeAnnouncing))
+
+              return
+            }
+
+            if (!isExtensionIdentity(event.data.identity)) {
+              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIdentityInvalid))
+
+              return
+            }
+
+            p.extensionIdentity = event.data.identity
+
+            send(peer, {
+              type: 'extension:announced',
+              data: event.data,
+              metadata: createEventMetadata(instanceId, event.metadata?.event.id),
+            })
+
+            for (const other of peers.values()) {
+              if (other.authenticated && !(other.peer.id === peer.id)) {
+                send(other.peer, {
+                  type: 'extension:announced',
+                  data: event.data,
+                  metadata: createEventMetadata(instanceId, event.metadata?.event.id),
+                })
+              }
+            }
+
+            return
+          }
+
+          case 'extension:module:announce': {
+            const p = peers.get(peer.id)
+            if (!p) {
+              return
+            }
+
+            if (authToken && !p.authenticated) {
+              send(peer, RESPONSES.error(ServerErrorMessages.mustAuthenticateBeforeAnnouncing))
+
+              return
+            }
+
+            const { name, identity } = event.data
+            if (!name || typeof name !== 'string') {
+              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceNameInvalid))
+
+              return
+            }
+
+            if (!isExtensionModuleIdentity(identity)) {
+              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIdentityInvalid))
+
+              return
+            }
+
+            if (p.extensionIdentity && identity.extension.id !== p.extensionIdentity.id) {
+              send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIdentityInvalid))
+
+              return
+            }
+
+            p.extensionIdentity = identity.extension
+            registerExtensionModulePeer(p, { name, identity })
+
+            send(peer, {
+              type: 'extension:module:announced',
+              data: event.data,
+              metadata: createEventMetadata(instanceId, event.metadata?.event.id),
+            })
+
+            for (const other of peers.values()) {
+              if (other.authenticated && !(other.peer.id === peer.id)) {
+                send(other.peer, {
+                  type: 'extension:module:announced',
+                  data: event.data,
+                  metadata: createEventMetadata(instanceId, event.metadata?.event.id),
+                })
+              }
+            }
+
+            return
+          }
+
           case 'module:announce': {
             const p = peers.get(peer.id)
             if (!p) {
@@ -629,7 +844,7 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
                 return
               }
             }
-            if (!identity || identity.kind !== 'plugin' || !identity.plugin?.id) {
+            if (!isLegacyModuleIdentity(identity)) {
               send(peer, RESPONSES.error(ServerErrorMessages.moduleAnnounceIdentityInvalid))
 
               return
@@ -675,7 +890,7 @@ export function setupApp(options?: AppOptions): { app: H3, closeAllPeers: () => 
               identity?: MetadataEventSource
               config?: Record<string, unknown>
             }
-            const moduleName = data.moduleName ?? data.identity?.plugin?.id ?? ''
+            const moduleName = data.moduleName ?? (isLegacyModuleIdentity(data.identity) ? data.identity.plugin.id : '') ?? ''
             const moduleIndex = data.moduleIndex
             const config = data.config
 

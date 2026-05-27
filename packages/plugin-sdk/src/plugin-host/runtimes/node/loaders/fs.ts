@@ -1,6 +1,6 @@
 import type { definePlugin } from '../../../../plugin'
 import type { Plugin } from '../../../../plugin/shared'
-import type { ManifestV1, PluginLoadOptions } from '../../../shared/types'
+import type { ExtensionManifestV1, PluginLoadOptions } from '../../../shared/types'
 
 import { isAbsolute, join } from 'node:path'
 import { cwd } from 'node:process'
@@ -58,9 +58,9 @@ export class FileSystemLoader {
    * Resolution order:
    * 1) `entrypoints.<runtime>`
    * 2) `entrypoints.default`
-   * 3) `entrypoints.electron` (legacy fallback for current local plugin manifests)
+   * 3) `entrypoints.electron` (legacy fallback for current local extension manifests)
    */
-  resolveEntrypointFor(manifest: ManifestV1, options?: PluginLoadOptions) {
+  resolveEntrypointFor(manifest: ExtensionManifestV1, options?: PluginLoadOptions) {
     const runtime = options?.runtime ?? 'electron'
     const root = options?.cwd ?? cwd()
     const entrypoint
@@ -72,14 +72,14 @@ export class FileSystemLoader {
       throw new Error(''
         + `Plugin entrypoint is required for runtime \`${runtime}\`. `
         + 'Define one of `entrypoints.<runtime>`, `entrypoints.default`, '
-        + 'or `entrypoints.electron` in the plugin manifest.',
+        + 'or `entrypoints.electron` in the extension manifest.',
       )
     }
 
     return isAbsolute(entrypoint) ? entrypoint : join(root, entrypoint)
   }
 
-  async loadLazyPluginFor(manifest: ManifestV1, options?: PluginLoadOptions) {
+  async loadLazyPluginFor(manifest: ExtensionManifestV1, options?: PluginLoadOptions) {
     const entrypoint = this.resolveEntrypointFor(manifest, options)
     const pluginModule = await import(entrypoint)
 
@@ -97,7 +97,7 @@ export class FileSystemLoader {
     throw new Error('Plugin lazy loader expects a definePlugin(...) export.')
   }
 
-  async loadPluginFor(manifest: ManifestV1, options?: PluginLoadOptions) {
+  async loadPluginFor(manifest: ExtensionManifestV1, options?: PluginLoadOptions) {
     const entrypoint = this.resolveEntrypointFor(manifest, options)
     const pluginModule = await import(entrypoint)
     return coercePluginFromModule(pluginModule)

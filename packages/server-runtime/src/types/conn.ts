@@ -1,4 +1,4 @@
-import type { MetadataEventSource } from '@proj-airi/server-shared/types'
+import type { ExtensionIdentity, ExtensionModuleIdentity, ModuleIdentity } from '@proj-airi/server-shared/types'
 
 export interface Peer {
   /**
@@ -26,6 +26,16 @@ export interface NamedPeer {
   peer: Peer
 }
 
+/**
+ * Tracks one module announced by an extension over a websocket peer.
+ */
+export interface RegisteredExtensionModule {
+  /** Human-readable module name used by registry sync and legacy routing lookup. */
+  name: string
+  /** Module identity scoped to the owning extension session. */
+  identity: ExtensionModuleIdentity
+}
+
 export enum WebSocketReadyState {
   CONNECTING = 0,
   OPEN = 1,
@@ -35,7 +45,9 @@ export enum WebSocketReadyState {
 
 export interface AuthenticatedPeer extends NamedPeer {
   authenticated: boolean
-  identity?: MetadataEventSource
+  identity?: ModuleIdentity
+  extensionIdentity?: ExtensionIdentity
+  extensionModules?: Map<string, RegisteredExtensionModule>
   lastHeartbeatAt?: number
   healthy?: boolean
   missedHeartbeats?: number

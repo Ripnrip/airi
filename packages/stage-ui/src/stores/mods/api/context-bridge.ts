@@ -14,7 +14,7 @@ import { nanoid } from 'nanoid'
 import { defineStore, storeToRefs } from 'pinia'
 import { ref, toRaw, watch } from 'vue'
 
-import { getEventSourceKey } from '../../../utils/event-source'
+import { getEventSourceKey, getMetadataSourceLabel } from '../../../utils/event-source'
 import { useCharacterOrchestratorStore } from '../../character'
 import { useChatOrchestratorStore } from '../../chat'
 import { CHAT_STREAM_CHANNEL_NAME, CONTEXT_CHANNEL_NAME } from '../../chat/constants'
@@ -414,13 +414,13 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
           contextId: event.contextId,
           eventId: event.id,
           textPreview: event.text,
-          sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id,
+          sourceLabel: getMetadataSourceLabel(event.metadata?.source),
           details: event,
         })
         const ingestAttempt = ingestContextMessageSafely({
           channel: 'broadcast',
           contextMessage: event,
-          sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id,
+          sourceLabel: getMetadataSourceLabel(event.metadata?.source),
           details: event,
         })
         if (ingestAttempt.ok && ingestAttempt.result) {
@@ -434,7 +434,7 @@ export const useContextBridgeStore = defineStore('mods:api:context-bridge', () =
             eventId: event.id,
             mutation: ingestAttempt.result.mutation,
             textPreview: event.text,
-            sourceLabel: event.metadata?.source?.plugin?.id ?? event.metadata?.source?.id,
+            sourceLabel: getMetadataSourceLabel(event.metadata?.source),
             details: {
               entryCount: ingestAttempt.result.entryCount,
               event,

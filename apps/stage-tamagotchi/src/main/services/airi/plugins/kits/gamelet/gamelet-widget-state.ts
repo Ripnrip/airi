@@ -1,7 +1,7 @@
 import type {
   BindingRecord,
+  ExtensionHost,
   HostDataRecord,
-  PluginHost,
 } from '@proj-airi/plugin-sdk/plugin-host'
 
 import type { WidgetWindowSize } from '../../../../../../shared/eventa'
@@ -36,18 +36,18 @@ function toWindowSize(value: unknown): WidgetWindowSize | undefined {
  * Resolves one owned gamelet binding and rejects mismatched ownership.
  *
  * Use when:
- * - Plugin sessions invoke `session.apis.gamelets.*`
+ * - Extension sessions invoke `session.apis.gamelets.*`
  * - The gamelet kit must enforce plugin and session ownership before touching widget state
  *
  * Expects:
- * - `host` is the active plugin host instance
+ * - `host` is the active extension host instance
  * - `moduleId` refers to a binding announced through `kit.gamelet`
  *
  * Returns:
  * - The owned gamelet binding record when ownership and kit checks pass
  */
 export function getOwnedGameletBindingOrThrow(params: {
-  host: PluginHost
+  host: ExtensionHost
   ownerPluginId: string
   ownerSessionId: string
   moduleId: string

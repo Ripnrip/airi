@@ -5,9 +5,104 @@ import type { TamagotchiToolContext } from './index'
 import { object, optional, string } from 'valibot'
 import { describe, expect, it, vi } from 'vitest'
 
-import { defineGamelet, defineToolset } from './index'
+import { defineGamelet, defineToolset, gameletKit, toolKit } from './index'
 
 describe('plugin-sdk-tamagotchi', () => {
+  it('exposes gameletKit as a module-scoped kit client', async () => {
+    const bindings: unknown[] = []
+    const client = gameletKit.createClient({
+      extensionId: 'airi-extension-chess',
+      sessionId: 'session-1',
+      moduleId: 'chess',
+      bindings: {
+        bind: async (input: unknown) => {
+          bindings.push(input)
+          return { moduleId: 'chess:gamelet', state: 'active' }
+        },
+      },
+    } as never)
+
+    await client.mount({
+      title: 'Chess',
+      ui: client.iframe({ assetPath: 'ui/index.html' }),
+      defaults: { airiSide: 'black' },
+    })
+
+    expect(bindings).toHaveLength(1)
+    expect(bindings[0]).toMatchObject({
+      moduleId: 'chess:gamelet',
+      kitId: 'kit.gamelet',
+      kitModuleType: 'gamelet',
+    })
+  })
+
+  /**
+   * @example
+   * expect(registerTool).toHaveBeenCalledWith(expect.objectContaining({ tool: expect.objectContaining({ id: 'play_chess' }) }))
+   * expect(registerPrompt).toHaveBeenCalledWith(expect.objectContaining({ id: 'chess-tools' }))
+   */
+  it('exposes toolKit as a module-scoped kit client', async () => {
+    const registerTool = vi.fn()
+    const registerPrompt = vi.fn()
+    const openGamelet = vi.fn()
+
+    const client = toolKit.createClient({
+      extensionId: 'airi-extension-chess',
+      sessionId: 'session-1',
+      moduleId: 'chess',
+      tools: {
+        register: registerTool,
+        registerToolsetPrompt: registerPrompt,
+      },
+      gamelets: {
+        open: openGamelet,
+        configure: vi.fn(),
+        request: vi.fn(async () => ({})),
+        close: vi.fn(),
+        isOpen: vi.fn(() => true),
+      },
+    } as never)
+
+    await client.registerToolset({
+      id: 'chess-tools',
+      prompt: {
+        id: 'airi-plugin-game-chess.prompt',
+        title: 'Chess Plugin Guidance',
+        content: 'Do not pass fen or pgn when mode is "new".',
+      },
+      tools: [
+        {
+          id: 'play_chess',
+          title: 'Play Chess',
+          description: 'Open chess.',
+          inputSchema: object({}),
+          async execute(_input, context) {
+            await context.gamelets.open('chess')
+            return { ok: true }
+          },
+        },
+      ],
+    })
+
+    expect(registerPrompt).toHaveBeenCalledWith({
+      id: 'chess-tools',
+      prompt: {
+        id: 'airi-plugin-game-chess.prompt',
+        title: 'Chess Plugin Guidance',
+        content: 'Do not pass fen or pgn when mode is "new".',
+      },
+    })
+    expect(registerTool).toHaveBeenCalledWith(expect.objectContaining({
+      tool: expect.objectContaining({
+        id: 'play_chess',
+      }),
+    }))
+
+    await registerTool.mock.calls[0]?.[0].execute({})
+
+    expect(openGamelet).toHaveBeenCalledWith('chess')
+  })
+
   /**
    * @example
    * expect(registerBinding).toHaveBeenCalledWith(expect.objectContaining({ kitId: 'kit.gamelet' }))
